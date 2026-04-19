@@ -1,29 +1,27 @@
 # ST458 Group Project — GBM Based Trading Strategy
 
-## How to Use
+## 怎么用
 
-Dead simple, three steps:
+超简单，三步：
 
-1. Clone the whole repo, keep the folder structure as-is
-2. Open `Report Template.Rmd` in RStudio
-3. Hit **Knit** (or `Knit to PDF`) — it will produce `Report-Template.pdf`
+1. 把整个 repo clone 下来（或者整个zip下载下来），保持文件夹结构别动
+2. 在 RStudio 里打开 `Report Template.Rmd`
+3. 点 **Knit** (或者 `Knit to PDF`)，会自动生成 `Report-Template.pdf`
 
-### Notes
+### 注意事项
 
-- Several chunks are set to `cache=TRUE`, so the first knit takes a bit longer (mainly training LightGBM and running the walk-forward backtest). Subsequent knits are fast.
-- The hyperparameter tuning chunk is set to `eval=FALSE` by default — it just reads `./Results/hp_tuning_results.rds` so you don't have to re-run the grid search every time. If you want to re-run it, remove `eval=FALSE` from that chunk.
-
----
-
-## Folder Overview
-
-| Path | Contents |
-|------|----------|
-| `Report Template.Rmd` | Main report file — this is the one you knit |
-| `Report-Template.pdf` | Rendered PDF output, for reference |
-| `Data/` | Training data `df_train.csv` — 100 synthetic ETFs with open/close/volume |
-| `Strategy/` | Three strategy scripts: `GroupA.R` (our LightGBM strategy, the main one), `Real.R` (momentum benchmark), `Equal.R` (equal-weight baseline) |
-| `Test/` | `walk_forward.R` — the backtest framework, sourced by the Rmd |
-| `Results/` | Cached hyperparameter tuning results (`hp_tuning_results.rds`) so the grid search doesn't re-run on every knit |
+- 有几个 chunk 设了 `cache=TRUE`，第一次 knit 会稍微慢一点 (主要是训练 LightGBM 和跑 walk-forward backtest)，之后就快了。
+- 超参数调优的 chunk 默认 `eval=FALSE`，直接读 `./Results/hp_tuning_results.rds`，不会重跑网格搜索。要重跑的话把那个 chunk 的 `eval=FALSE` 去掉就行。
 
 ---
+
+## 文件夹说明
+
+| 路径 | 内容 |
+|------|------|
+| `Report Template.Rmd` | 报告主文件，直接 knit 这个就行 |
+| `Report-Template.pdf` | knit 出来的成品 PDF，参考用 |
+| `Data/` | 训练数据 `df_train.csv`，100 只合成 ETF 的 open/close/volume |
+| `Strategy/` | 三个策略脚本：`GroupA.R` (我们的 LightGBM 策略，主角)、`Real.R` (momentum benchmark)、`Equal.R` (equal-weight 基准) |
+| `Test/` | `walk_forward.R`，回测框架，Rmd 里会 source 它 |
+| `Results/` | 缓存的超参数调优结果 (`hp_tuning_results.rds`)，避免每次 knit 都重跑网格搜索 |
