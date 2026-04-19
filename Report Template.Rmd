@@ -31,7 +31,7 @@ df <- read.csv("./Data/df_train.csv")
 
 The data arrives in **long** format (one row per ETF per day). Feature engineering requires **wide** format: matrices where rows = dates and columns = ETFs.
 
-```{r reshape-data}
+```{r reshape-data, include=FALSE}
 dt      <- as.data.table(df)
 dt[, date := as.Date(date)]
 dates   <- sort(unique(dt$date))
@@ -167,11 +167,9 @@ compute_ic <- function(y_true, y_pred, date_vec) {
 
 The CV scheme is illustrated conceptually as a sliding window: each fold's training window is 252 days, the validation window is 21 days, and a gap of exactly `lookahead` days separates them — guaranteeing no target labels from the training period contaminate the validation labels.
 
----
-
 # 2. Feature Engineering
 
-Our features extend the Week 8 tutorial's feature set.  We compute all 31 base features for the entire training period at once using `compute_all_features` from `gbm1.R`.
+Our features extend the Week 8 tutorial's feature set.  We compute all 40 base features for the entire training period at once using `compute_all_features` in our strategy.
 
 ```{r source-and-compute}
 source("./Strategy/GroupA.R")
@@ -189,41 +187,9 @@ cat("Feature array dimensions [dates x ETFs x base features]:", dim(feat_3d), "\
 
 ## 2.1 Week 8 Baseline Features
 
-The following features are shared with the Week 8 tutorial.  We show the mathematical definition; the exact vectorised implementation is in `gbm1.R`.
-
-### RSI — Relative Strength Index
-
-$$AG_t = \frac{13\,AG_{t-1} + \max(\Delta_t,\,0)}{14},\quad AL_t = \frac{13\,AL_{t-1} + \max(-\Delta_t,\,0)}{14},\quad
-  \text{RSI}_t = 100 - \frac{100}{1 + AG_t/AL_t}$$
-
-### Bollinger Bands
-
-$$\text{BB\_high} = \frac{\text{close} - (\text{SMA}_{20} + 2\sigma_{20})}{\text{close}},\quad
-  \text{BB\_low}  = \frac{\text{close} - (\text{SMA}_{20} - 2\sigma_{20})}{\text{close}}$$
-
-### MACD and PPO
-
-$$\text{MACD} = \text{EMA}_{12} - \text{EMA}_{26},\quad
-  \text{PPO}  = \frac{\text{MACD}}{\text{EMA}_{26}} \times 100,\quad
-  \alpha_{12}=\tfrac{2}{13},\;\alpha_{26}=\tfrac{2}{27}$$
-
-### Returns at Multiple Horizons
-
-$$r_k^{(t)} = \frac{\text{close}_t}{\text{close}_{t-k}} - 1,\quad k \in \{1,5,10,21,42,63\}$$
-
-### Cross-Sectional Deciles
-
-For each day, ETFs are ranked by each return horizon and assigned to deciles 1-10 (10 = top performers), removing common market trends.
-
-### Date and Rank Features
-
-`month` (1-12), `weekday` (1-5), and `dollar_vol_rank` (fractional rank of $\log(1 + \text{close} \times \text{vol})$ across 100 ETFs per day).
-
-### Features from Week 8 Not Used
+We reuse the following technical indicators from the Week 8 tutorial: RSI (14-day relative strength), Bollinger Bands (price position vs. 20-day SMA $\pm\, 2\sigma$), MACD and PPO (trend indicators from 12/26-day EMA spreads), multi-horizon returns over 1/5/10/21/42/63 days, cross-sectional deciles of each return horizon across the 100 ETFs (which strip out common market moves), and date/rank features (month, weekday, and fractional rank of log dollar volume).
 
 **NATR**, **ATR**, **sector**, and **sector-quantile returns** are omitted — our dataset consists of synthetic ETFs with no sector classification.
-
----
 
 ## 2.2 Features Additional to Week 8
 
@@ -317,8 +283,6 @@ Linearly redundant with `r05`/`r21` but rescaled. Tree-based splits depend on th
 ## 2.3 Feature Summary
 
 The final feature set contains 40 engineered features across eight categories: 6 technical indicators (RSI, Bollinger Bands, MACD, PPO, MACD histogram), 7 price/moving-average spreads and crossovers, 6 multi-horizon returns, 4 multi-window realised volatility measures, 4 volume-based features (ratio, trend, log dollar volume, and open-close return), 4 rate of change/z-score features, 2 calendar features (month and weekday), and 7 cross-sectional features (deciles plus dollar-volume rank).
-
----
 
 # 3. Model Development
 
@@ -608,7 +572,7 @@ $$
 
 is substantially larger for LightGBM, suggesting a higher signal-to-noise ratio in the resulting portfolio returns.
 
----
+
 
 # 4. Final Strategy Explanation
 
