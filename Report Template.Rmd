@@ -1,0 +1,965 @@
+---
+title: "ST458 Group Project"
+author: "Group A"
+date: "2026-04-16"
+output:
+  pdf_document:
+    toc: false
+    number_sections: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.width = 9, fig.height = 4)
+library(data.table)
+library(lightgbm)
+library(ggplot2)
+```
+
+# 1. Data Processing
+
+## 1.1 What We Have
+
+We start with 100 synthetic ETFs. Each day, for each ETF, we observe:
+- `open`: Opening price, `close`: Closing price, `volume`: Trading volume
+
+```{r load-data, results='hide'}
+df <- read.csv("./Data/df_train.csv")
+```
+
+## 1.2 Reshaping: From Long to Wide
+
+The data arrives in **long** format (one row per ETF per day). Feature engineering requires **wide** format: matrices where rows = dates and columns = ETFs.
+
+```{r reshape-data}
+dt      <- as.data.table(df)
+dt[, date := as.Date(date)]
+dates   <- sort(unique(dt$date))
+symbols <- sort(unique(dt$symbol))
+n_dates <- length(dates);  n_syms <- length(symbols)
+
+close_mat <- matrix(NA_real_, n_dates, n_syms,
+                    dimnames = list(as.character(dates), symbols))
+vol_mat   <- matrix(NA_real_, n_dates, n_syms,
+                    dimnames = list(as.character(dates), symbols))
+open_mat  <- matrix(NA_real_, n_dates, n_syms,
+                    dimnames = list(as.character(dates), symbols))
+
+for (i in seq_along(dates)) {
+  sub <- dt[date == dates[i]]
+  idx <- match(sub$symbol, symbols)
+  close_mat[i, idx] <- sub$close
+  vol_mat[i, idx]   <- sub$volume
+  open_mat[i, idx]  <- sub$open
+}
+
+head(close_mat[, 1:5])
+```
+
+## 1.3 Why Vectorised Operations?
+
+Wide format enables **vectorised operations**: instead of looping over each ETF we compute across all 100 simultaneously using matrix arithmetic, which is ~100x faster.
+
+```{r vectorized-vs-loop, results='hide'}
+loop_sma5 <- function() {
+  result <- matrix(NA, nrow(close_mat), ncol(close_mat))
+  for (j in 1:ncol(close_mat))
+    for (i in 5:nrow(close_mat))
+      result[i, j] <- mean(close_mat[(i-4):i, j])
+  result
+}
+vectorised_sma5 <- function() {
+  cs  <- apply(close_mat, 2, cumsum)
+  cs0 <- rbind(rep(0, ncol(close_mat)), cs)
+  out <- matrix(NA, nrow(close_mat), ncol(close_mat))
+  out[5:nrow(close_mat), ] <-
+    (cs0[6:(nrow(close_mat) + 1), ] - cs0[1:(nrow(close_mat) - 4), ]) / 5
+  out
+}
+t_loop <- system.time(loop_sma5())["elapsed"]
+t_vec  <- system.time(vectorised_sma5())["elapsed"]
+cat(sprintf("Loop: %.3f s   Vectorised: %.4f s   Speed-up: ~%.0fx\n",
+            t_loop, t_vec, t_loop / max(t_vec, 1e-4)))
+```
+
+The vectorised cumsum approach achieves approximately **100x speed-up** over the naive nested loop.
+
+## 1.4 Time Series Split and Cross-Validation Setup
+
+Following the Week 8 tutorial we split data into training (2010-2012) and test (2013+) periods, and define rolling CV folds within training. We also define the two helper functions used throughout Section 3: `flatten_features` converts the 3D feature array to the 2D matrix LightGBM expects, and `compute_ic` measures the Information Coefficient (mean daily Spearman correlation of predicted vs actual returns).
+
+```{r time-series-split, results='hide'}
+# Global strategy parameters (identical to gbm1.R)
+train_length <- 252;  lookahead <- 21;  retrain_freq <- 21
+n_long <- 10;  n_short <- 10;  warmup_days <- 200
+
+# Time-series CV split (from Week 8 Tutorial)
+# Gap of `lookahead` days is enforced between train end and validation start,
+# preventing any look-ahead bias from the prediction horizon.
+time_series_split <- function(dates, n_splits = 0,
+                               train_length = 252, valid_length = 21, lookahead = 21) {
+  unique_dates    <- sort(unique(dates), decreasing = TRUE)
+  if (n_splits == 0) {
+    block_length <- train_length + valid_length + lookahead
+    n_splits     <- (length(unique_dates) - block_length) %/% valid_length
+  }
+  valid_end_idx   <- ((1:n_splits) - 1) * valid_length + 1
+  valid_start_idx <- valid_end_idx   + valid_length - 1
+  train_end_idx   <- valid_start_idx + lookahead    + 1
+  train_start_idx <- train_end_idx   + train_length - 1
+  splits <- vector("list", n_splits)
+  for (i in 1:n_splits)
+    splits[[i]] <- list(
+      train = which(dates >= unique_dates[train_start_idx[i]] &
+                      dates <= unique_dates[train_end_idx[i]]),
+      valid = which(dates >= unique_dates[valid_start_idx[i]] &
+                      dates <= unique_dates[valid_end_idx[i]])
+    )
+  splits
+}
+
+# Train: 2010-2012  |  Test: 2013+
+split_date  <- as.Date("2013-01-01")
+train_rows  <- which(dates <  split_date)
+test_rows   <- which(dates >= split_date)
+
+close_train <- close_mat[train_rows, ];  vol_train <- vol_mat[train_rows, ]
+open_train  <- open_mat[train_rows, ]
+close_test  <- close_mat[test_rows, ];   vol_test  <- vol_mat[test_rows, ]
+open_test   <- open_mat[test_rows, ]
+
+cat(sprintf("Train: %s to %s (%d days)\n",
+            rownames(close_train)[1], tail(rownames(close_train), 1), nrow(close_train)))
+cat(sprintf("Test : %s to %s (%d days)\n",
+            rownames(close_test)[1],  tail(rownames(close_test),  1), nrow(close_test)))
+
+train_dates <- as.Date(rownames(close_train))
+cv_splits   <- time_series_split(train_dates, train_length = train_length,
+                                  valid_length = 21, lookahead = lookahead)
+cat("Number of CV folds available:", length(cv_splits), "\n")
+```
+
+```{r cv-helpers, include=FALSE}
+# Flatten feat_3d [date x ETF x feature] -> 2D [obs x feature] for LightGBM.
+# Mirrors build_training_data in gbm1.R: skip warmup rows, drop NA labels.
+flatten_features <- function(feat_3d, r_fwd, date_idx) {
+  date_idx  <- date_idx[date_idx > warmup_days]
+  m         <- dim(feat_3d)[2];  n_sel <- length(date_idx);  n_f <- dim(feat_3d)[3]
+  X <- matrix(NA_real_, n_sel * m, n_f);  y <- numeric(n_sel * m);  d <- character(n_sel * m)
+  for (ri in seq_along(date_idx)) {
+    i <- date_idx[ri];  rows <- ((ri - 1) * m + 1):(ri * m)
+    X[rows, ] <- feat_3d[i, , ];  y[rows] <- r_fwd[i, ];  d[rows] <- as.character(i)
+  }
+  ok <- !is.na(y) & rowSums(is.na(X)) == 0
+  X[is.na(X)] <- 0
+  list(X = X[ok, , drop = FALSE], y = y[ok], date = d[ok])
+}
+
+# IC: mean day-by-day Spearman correlation (Week 8 metric)
+compute_ic <- function(y_true, y_pred, date_vec) {
+  mean(sapply(unique(date_vec), function(d) {
+    idx <- date_vec == d
+    if (sum(idx) < 2) return(NA_real_)
+    cor(y_true[idx], y_pred[idx], method = "spearman")
+  }), na.rm = TRUE)
+}
+```
+
+The CV scheme is illustrated conceptually as a sliding window: each fold's training window is 252 days, the validation window is 21 days, and a gap of exactly `lookahead` days separates them — guaranteeing no target labels from the training period contaminate the validation labels.
+
+---
+
+# 2. Feature Engineering
+
+Our features extend the Week 8 tutorial's feature set.  We compute all 31 base features for the entire training period at once using `compute_all_features` from `gbm1.R`.
+
+```{r source-and-compute}
+source("./Strategy/GroupA.R")
+
+res_train     <- compute_all_features(close_train, vol_train, open_train)
+feat_3d       <- res_train$feat_3d
+
+n_tr          <- nrow(close_train)
+r21_fwd_train <- matrix(NA_real_, n_tr, ncol(close_train))
+for (i in 1:(n_tr - lookahead))
+  r21_fwd_train[i, ] <- close_train[i + lookahead, ] / close_train[i, ] - 1
+
+cat("Feature array dimensions [dates x ETFs x base features]:", dim(feat_3d), "\n")
+```
+
+## 2.1 Week 8 Baseline Features
+
+The following features are shared with the Week 8 tutorial.  We show the mathematical definition; the exact vectorised implementation is in `gbm1.R`.
+
+### RSI — Relative Strength Index
+
+$$AG_t = \frac{13\,AG_{t-1} + \max(\Delta_t,\,0)}{14},\quad AL_t = \frac{13\,AL_{t-1} + \max(-\Delta_t,\,0)}{14},\quad
+  \text{RSI}_t = 100 - \frac{100}{1 + AG_t/AL_t}$$
+
+### Bollinger Bands
+
+$$\text{BB\_high} = \frac{\text{close} - (\text{SMA}_{20} + 2\sigma_{20})}{\text{close}},\quad
+  \text{BB\_low}  = \frac{\text{close} - (\text{SMA}_{20} - 2\sigma_{20})}{\text{close}}$$
+
+### MACD and PPO
+
+$$\text{MACD} = \text{EMA}_{12} - \text{EMA}_{26},\quad
+  \text{PPO}  = \frac{\text{MACD}}{\text{EMA}_{26}} \times 100,\quad
+  \alpha_{12}=\tfrac{2}{13},\;\alpha_{26}=\tfrac{2}{27}$$
+
+### Returns at Multiple Horizons
+
+$$r_k^{(t)} = \frac{\text{close}_t}{\text{close}_{t-k}} - 1,\quad k \in \{1,5,10,21,42,63\}$$
+
+### Cross-Sectional Deciles
+
+For each day, ETFs are ranked by each return horizon and assigned to deciles 1-10 (10 = top performers), removing common market trends.
+
+### Date and Rank Features
+
+`month` (1-12), `weekday` (1-5), and `dollar_vol_rank` (fractional rank of $\log(1 + \text{close} \times \text{vol})$ across 100 ETFs per day).
+
+### Features from Week 8 Not Used
+
+**NATR**, **ATR**, **sector**, and **sector-quantile returns** are omitted — our dataset consists of synthetic ETFs with no sector classification.
+
+---
+
+## 2.2 Features Additional to Week 8
+
+### MACD Histogram
+
+$$\text{Signal}_t = \text{Signal}_{t-1} + \tfrac{2}{10}(\text{MACD}_t - \text{Signal}_{t-1}),\quad
+  \text{MACD\_hist} = \text{MACD} - \text{Signal}$$
+
+```{r macd-hist-plot, fig.height=3, include=FALSE}
+plot(train_dates, feat_3d[, 1, 6], type = "l", col = "darkorange",
+     xlab = "Date", ylab = "MACD Histogram",
+     main = "MACD Histogram (ETF 1) - momentum acceleration signal")
+abline(h = 0, lty = 2)
+```
+
+### Price vs. Moving Average Spreads
+
+$$\text{price\_sma}K = \frac{\text{close} - \text{SMA}_K}{\text{close}},\quad K \in \{5,10,20,50,200\}$$
+
+```{r price-sma-plot, fig.height=3, include=FALSE}
+plot(train_dates, feat_3d[, 1, 9], type = "l", col = "steelblue",
+     xlab = "Date", ylab = "(close - SMA20) / close",
+     main = "Price vs SMA20 Spread (ETF 1) - positive = price above trend")
+abline(h = 0, lty = 2)
+```
+
+### Moving Average Crossovers
+
+$$\text{sma5\_sma20} = \frac{\text{SMA}_5 - \text{SMA}_{20}}{\text{close}},\quad
+  \text{sma10\_sma50} = \frac{\text{SMA}_{10} - \text{SMA}_{50}}{\text{close}}$$
+
+```{r ma-cross-plot, fig.height=3, include=FALSE}
+plot(train_dates, feat_3d[, 1, 12], type = "l", col = "purple",
+     xlab = "Date", ylab = "(SMA5 - SMA20) / close",
+     main = "MA Crossover Signal (ETF 1) - positive = short-term momentum")
+abline(h = 0, lty = 2)
+```
+
+### Realised Volatility
+
+$$\text{rvol}_w = \sqrt{\widehat{\text{Var}}\!\left(\log\tfrac{\text{cl}_t}{\text{cl}_{t-1}}\right)_{w\text{-day}} \times 252},\quad w \in \{5,10,21,63\}$$
+
+```{r rvol-plot, fig.height=3, include=FALSE}
+plot(train_dates, feat_3d[, 1, 22], type = "l", col = "darkred",
+     xlab = "Date", ylab = "Annualised Volatility",
+     main = "21-day Realised Volatility (ETF 1) - volatility clustering visible")
+```
+
+### Volume Features
+
+$$\text{vol\_ratio} = \frac{\text{vol}}{\text{SMA}_{20}(\text{vol})},\quad
+  \text{vol\_trend} = \frac{\text{SMA}_5(\text{vol}) - \text{SMA}_{20}(\text{vol})}{\text{SMA}_{20}(\text{vol})},\quad
+  \text{log\_dollar\_vol} = \log(1 + \text{close} \times \text{vol})$$
+
+```{r vol-plot, fig.height=3, include=FALSE}
+plot(train_dates, feat_3d[, 1, 24], type = "l", col = "darkgreen",
+     xlab = "Date", ylab = "Volume / SMA20(Volume)",
+     main = "Volume Ratio (ETF 1) - spikes indicate unusual trading activity")
+abline(h = 1, lty = 2)
+```
+
+### Open-Close Return
+
+$$\text{oc\_ret} = \frac{\text{close} - \text{open}}{\text{open}}$$
+
+```{r oc-plot, fig.height=3, include=FALSE}
+hist(feat_3d[, 1, 27], breaks = 60, col = "steelblue", border = "white",
+     main = "Open-Close Return Distribution (ETF 1)",
+     xlab = "(close - open) / open")
+```
+
+### Z-Scores
+
+$$\text{zscore}_K = \frac{\text{close} - \text{SMA}_K}{\sigma_K},\quad K \in \{20, 50\}$$
+
+```{r zscore-plot, fig.height=3, include=FALSE}
+par(mfrow = c(1, 2))
+hist(feat_3d[, 1, 30], breaks = 50, col = "steelblue", border = "white",
+     main = "Z-score (SMA20, ETF 1)", xlab = "Z-score")
+hist(feat_3d[, 1, 31], breaks = 50, col = "coral",     border = "white",
+     main = "Z-score (SMA50, ETF 1)", xlab = "Z-score")
+par(mfrow = c(1, 1))
+```
+
+### Rate of Change (ROC)
+
+$$\text{roc\_5} = r_5 \times 100,\quad \text{roc\_21} = r_{21} \times 100$$
+
+Linearly redundant with `r05`/`r21` but rescaled. Tree-based splits depend on threshold values, so a 100x scale shift creates finer-grained candidate splits in the small-return region.
+
+## 2.3 Feature Summary
+
+The final feature set contains 40 engineered features across eight categories: 6 technical indicators (RSI, Bollinger Bands, MACD, PPO, MACD histogram), 7 price/moving-average spreads and crossovers, 6 multi-horizon returns, 4 multi-window realised volatility measures, 4 volume-based features (ratio, trend, log dollar volume, and open-close return), 4 rate of change/z-score features, 2 calendar features (month and weekday), and 7 cross-sectional features (deciles plus dollar-volume rank).
+
+---
+
+# 3. Model Development
+
+Following the Week 8 tutorial we use **LightGBM** to predict cross-sectional ETF returns.  We treat the **prediction horizon** (candidate values: 5, 10, 21 days) alongside model complexity parameters as joint hyperparameters, tuning all via time-series CV with **IC** (Information Coefficient) as the evaluation metric.
+
+**No look-ahead risk from precomputation.** We precomputed `feat_3d` on the full training period before constructing CV folds. This is safe because each feature `feat_3d[i, j, k]` depends only on prices and volumes up to and including day $i$: RSI and EMA use only recursive past-value smoothing; rolling variances use only cumulative sums of past observations; cross-sectional deciles rank the 100 ETFs within day $i$ only. We deliberately avoid global normalisation (e.g., dividing by the period-wide standard deviation), which would genuinely leak future information.
+
+## 3.1 Single Fold Evaluation
+
+We auto-select the first CV fold with non-empty validation labels (fold 1's validation forward returns extend into the test period and are all NA).
+
+```{r tscv-single-fold}
+fold <- NULL
+for (f in seq_along(cv_splits)) {
+  td_check <- flatten_features(feat_3d, r21_fwd_train, cv_splits[[f]]$valid)
+  if (nrow(td_check$X) > 0) { fold <- f; break }
+}
+cat(sprintf("Using fold %d\n", fold))
+
+td_tr <- flatten_features(feat_3d, r21_fwd_train, cv_splits[[fold]]$train)
+td_vl <- flatten_features(feat_3d, r21_fwd_train, cv_splits[[fold]]$valid)
+cat(sprintf("Train samples: %d   Val samples: %d\n", nrow(td_tr$X), nrow(td_vl$X)))
+
+# Set feature names so lgb.importance() reports real names, not column indices
+colnames(td_tr$X) <- covariate_names[1:ncol(td_tr$X)]
+colnames(td_vl$X) <- covariate_names[1:ncol(td_vl$X)]
+
+dtrain_demo <- lgb.Dataset(td_tr$X, label = td_tr$y)
+m_fold_demo <- lgb.train(lgb_params, dtrain_demo, nrounds = lgb_nrounds, verbose = -1)
+
+y_pred_v <- predict(m_fold_demo, td_vl$X)
+ic_val   <- compute_ic(td_vl$y, y_pred_v, td_vl$date)
+cat(sprintf("Validation IC (fold %d): %.4f\n", fold, ic_val))
+```
+
+```{r feature-importance, fig.height=4}
+fi <- lgb.importance(m_fold_demo, percentage = TRUE)
+n_show <- min(20, nrow(fi))
+old_mar <- par("mar")
+par(mar = c(7, 4, 3, 1))
+barplot(fi$Gain[1:n_show],
+        names.arg = fi$Feature[1:n_show],
+        las = 2, col = "steelblue", border = NA,
+        main = "LightGBM Feature Importance - Top 20 by Gain",
+        ylab = "Gain (normalised)")
+par(mar = old_mar)
+```
+
+```{r single-fold-scatter, fig.height=3.5}
+plot(td_vl$y, y_pred_v, pch = 20,
+     col  = adjustcolor("steelblue", 0.25),
+     xlab = "Actual 21-day Return", ylab = "Predicted Return",
+     main = sprintf("Single Fold: Predicted vs Actual (IC = %.3f)", ic_val))
+abline(lm(y_pred_v ~ td_vl$y), col = "red", lwd = 2)
+```
+
+## 3.2 Multi-Fold Validation
+
+We evaluate across all available CV folds to obtain a more robust IC estimate and assess stability across different time periods.
+
+```{r multi-fold, cache=TRUE}
+n_folds   <- length(cv_splits)
+ic_folds  <- rep(NA_real_, n_folds)
+
+for (f in 1:n_folds) {
+  td_tr_f <- flatten_features(feat_3d, r21_fwd_train, cv_splits[[f]]$train)
+  td_vl_f <- flatten_features(feat_3d, r21_fwd_train, cv_splits[[f]]$valid)
+  if (nrow(td_vl_f$X) == 0 || nrow(td_tr_f$X) < 100) next
+  dtrain_f <- lgb.Dataset(td_tr_f$X, label = td_tr_f$y)
+  model_f  <- lgb.train(lgb_params, dtrain_f, nrounds = lgb_nrounds, verbose = -1)
+  ic_folds[f] <- compute_ic(td_vl_f$y, predict(model_f, td_vl_f$X), td_vl_f$date)
+}
+valid_ic <- ic_folds[!is.na(ic_folds)]
+cat(sprintf("Folds evaluated: %d / %d\n", sum(!is.na(ic_folds)), n_folds))
+cat(sprintf("Mean IC: %.4f   SD: %.4f   Min: %.4f   Max: %.4f\n",
+            mean(valid_ic), sd(valid_ic), min(valid_ic), max(valid_ic)))
+```
+
+```{r multi-fold-plot, fig.height=3.5}
+par(mfrow = c(1, 2))
+
+# IC by fold
+fold_idx <- which(!is.na(ic_folds))
+plot(fold_idx, ic_folds[fold_idx], type = "b", pch = 20, col = "steelblue",
+     xlab = "CV Fold", ylab = "IC",
+     main = "IC Across CV Folds")
+abline(h = mean(valid_ic), col = "red", lty = 2)
+abline(h = 0, col = "gray50", lty = 3)
+legend("topright", legend = c("Fold IC", "Mean IC"),
+       col = c("steelblue", "red"), lty = c(1, 2), pch = c(20, NA))
+
+# IC distribution
+hist(valid_ic, breaks = 10, col = "steelblue", border = "white",
+     main = "IC Distribution", xlab = "IC")
+abline(v = mean(valid_ic), col = "red", lwd = 2)
+par(mfrow = c(1, 1))
+```
+
+## 3.3 Hyperparameter Tuning
+
+We search jointly over **prediction horizon** (lookahead: 5, 10, 21 days) and model complexity parameters. The gap between training end and validation start is always at least `max(lookahead candidates) = 21` days, so no look-ahead bias is introduced regardless of which horizon is being tested.
+
+```{r hp-grid, include=FALSE}
+# Pre-compute forward returns for each candidate lookahead
+r05_fwd_train <- r10_fwd_train <- matrix(NA_real_, n_tr, ncol(close_train))
+for (i in 1:(n_tr - 5))  r05_fwd_train[i, ] <- close_train[i+5,]  / close_train[i,] - 1
+for (i in 1:(n_tr - 10)) r10_fwd_train[i, ] <- close_train[i+10,] / close_train[i,] - 1
+fwd_lookup <- list("5" = r05_fwd_train, "10" = r10_fwd_train, "21" = r21_fwd_train)
+
+param_df <- expand.grid(
+  lookahead_days   = c(5, 10, 21),
+  num_leaves       = c(3, 5, 10, 20),
+  learning_rate    = c(0.01, 0.03, 0.1),
+  feature_fraction = c(0.3, 0.6, 0.95),
+  bagging_fraction = c(0.3, 0.6, 0.95),
+  num_iterations   = c(50, 100, 200),
+  stringsAsFactors = FALSE
+)
+set.seed(458)
+n_search <- 50
+training_log <- param_df[sample(nrow(param_df), n_search), ]
+training_log$ic <- NA_real_
+rownames(training_log) <- NULL
+cat("Grid size:", nrow(param_df), "  Sampling:", n_search, "\n")
+```
+
+```{r hp-tuning, eval=FALSE}
+# Run manually -- saves to ./Results/hp_tuning_results.rds
+dir.create("./Results", showWarnings = FALSE)
+for (i in seq_len(nrow(training_log))) {
+  r_fwd_i <- fwd_lookup[[as.character(training_log$lookahead_days[i])]]
+  params_i <- list(
+    objective        = "regression",
+    num_leaves       = training_log$num_leaves[i],
+    learning_rate    = training_log$learning_rate[i],
+    feature_fraction = training_log$feature_fraction[i],
+    bagging_fraction = training_log$bagging_fraction[i],
+    min_data_in_leaf = 100
+  )
+  ic_cv <- numeric(length(cv_splits))
+  for (fold_i in seq_along(cv_splits)) {
+    td_tr_i <- flatten_features(feat_3d, r_fwd_i, cv_splits[[fold_i]]$train)
+    td_vl_i <- flatten_features(feat_3d, r_fwd_i, cv_splits[[fold_i]]$valid)
+    if (nrow(td_tr_i$X) < 100 || nrow(td_vl_i$X) == 0) { ic_cv[fold_i] <- NA_real_; next }
+    dtrain_i <- lgb.Dataset(td_tr_i$X, label = td_tr_i$y, free_raw_data = FALSE)
+    model_i  <- lgb.train(params_i, dtrain_i,
+                           nrounds = training_log$num_iterations[i], verbose = -1)
+    ic_cv[fold_i] <- compute_ic(td_vl_i$y, predict(model_i, td_vl_i$X), td_vl_i$date)
+  }
+  training_log$ic[i] <- mean(ic_cv, na.rm = TRUE)
+  if (i %% 10 == 0) cat(sprintf("  %d / %d done\n", i, nrow(training_log)))
+}
+saveRDS(training_log, "./Results/hp_tuning_results.rds")
+```
+
+```{r hp-results, fig.height=4}
+if (file.exists("./Results/hp_tuning_results.rds")) {
+  training_log <- readRDS("./Results/hp_tuning_results.rds")
+  i_opt <- which.max(training_log$ic)
+  cat("Best configuration (mean IC =", round(training_log$ic[i_opt], 4), "):\n")
+  print(training_log[i_opt, ])
+  par(mfrow = c(2, 3), mar = c(3, 2.5, 2, 1), mgp = c(1.5, 0.5, 0))
+  for (j in 1:5)
+    boxplot(ic ~ training_log[[j]], data = training_log,
+            xlab = colnames(training_log)[j], ylab = "IC",
+            main = colnames(training_log)[j], col = "lightblue")
+  par(mfrow = c(1, 1))
+} else {
+  cat("Run hp-tuning chunk to generate results.\n")
+  cat("Best known configuration (gbm1.R):\n")
+  print(data.frame(lookahead_days = 21, num_leaves = 3, learning_rate = 0.03,
+                   feature_fraction = 0.3, bagging_fraction = 0.8, num_iterations = 100))
+}
+```
+
+```{r hp-predict-scatter, fig.height=3.5}
+plot(td_vl$y, y_pred_v, pch = 20,
+     col  = adjustcolor("steelblue", 0.25),
+     xlab = "Actual Forward Return", ylab = "Predicted Return",
+     main = sprintf("Tuning Stage: Predicted vs Actual (IC = %.3f)", ic_val))
+abline(lm(y_pred_v ~ td_vl$y), col = "red", lwd = 2)
+```
+
+**Selected hyperparameters** (`lookahead = 21`, `num_leaves = 3`, `learning_rate = 0.03`, `bagging_fraction = 0.6`, `num_iterations = 200`): a 21-day horizon captures medium-term momentum; shallow trees with slow learning and strong regularisation prevent overfitting on noisy ETF returns.
+
+
+## 3.4 Model Comparison
+We compare the proposed LightGBM strategy against a simpler momentum benchmark. The two strategies are compared under exactly the same walk-forward framework: same train/test split, same daily close-price execution, same transaction cost of 5 basis points, and same portfolio size constraints. Therefore, any performance difference can be attributed to the signal-generation method rather than to differences in implementation.
+
+```{r Model Comparison, cache=TRUE, results='hide'}
+source("./Test/walk_forward.R")
+
+source("./Strategy/Real.R")
+initialise_state_mom  <- initialise_state
+trading_algorithm_mom <- trading_algorithm
+
+source("./Strategy/GroupA.R")
+initialise_state_lgb  <- initialise_state
+trading_algorithm_lgb <- trading_algorithm
+```
+
+```{r gbm-vs-momentum-backtest, cache=TRUE, message=FALSE, warning=FALSE, include=FALSE }
+bt_lgb <- walk_forward(trading_algorithm_lgb, initialise_state_lgb, df_train, df_test)
+
+bt_mom <- walk_forward(trading_algorithm_mom, initialise_state_mom, df_train, df_test)
+```
+
+```{r compare result}
+calc_metrics <- function(w) {
+  dr <- diff(w) / pmax(head(w, -1), 1e-10)
+  dr[is.na(dr) | is.infinite(dr)] <- 0
+
+  c(
+    LogWealth      = round(log(max(tail(w, 1), 1e-10)), 4),
+    FinalWealth    = round(tail(w, 1), 4),
+    SharpeRatio    = round(mean(dr) / max(sd(dr), 1e-10) * sqrt(252), 2),
+    MaxDrawdownPct = round(max(ifelse(cummax(w) > 0, (cummax(w)-w)/cummax(w), 0)) * 100, 2)
+  )
+}
+
+perf_cmp <- rbind(
+  "LightGBM Strategy" = calc_metrics(bt_lgb),
+  "Momentum Strategy" = calc_metrics(bt_mom)
+)
+
+print(perf_cmp)
+```
+
+```{r gbm-vs-momentum-plot, fig.height=4}
+plot(bt_lgb,
+     type = "l", col = "steelblue", lwd = 2,
+     xlab = "Test Day", ylab = "Wealth",
+     main = "Walk-Forward Backtest: LightGBM vs Momentum")
+lines(bt_mom, col = "darkorange", lwd = 2, lty = 2)
+abline(h = 1, col = "gray40", lty = 3)
+legend("topleft",
+       legend = c("LightGBM", "Momentum"),
+       col = c("steelblue", "darkorange"),
+       lty = c(1, 2), lwd = 2)
+```
+
+The momentum benchmark uses a one-dimensional ranking rule based only on past returns. If $r_i^{\mathrm{past}}(t)$ denotes the recent return signal for asset $i$, then its score can be written as
+
+$$
+s_i^{\mathrm{mom}}(t)=r_i^{\mathrm{past}}(t).
+$$
+
+Equivalently, momentum assumes that expected next-period return depends mainly on this single feature:
+
+$$
+\mathbb{E}[r_{i,t+1}\mid \mathcal{F}_t] \approx g\!\left(r_i^{\mathrm{past}}(t)\right).
+$$
+
+In contrast, LightGBM uses a higher-dimensional feature vector
+
+$$
+x_{i,t} = \bigl(x_{i,t}^{(1)},x_{i,t}^{(2)},\dots,x_{i,t}^{(p)}\bigr),
+$$
+
+which may include momentum, volatility, volume, moving-average gaps and other technical indicators, and approximates the conditional mean return by
+
+$$
+\hat{r}_{i,t+1} \approx m(x_{i,t}) = \mathbb{E}[r_{i,t+1}\mid x_{i,t}].
+$$
+
+The fitted LightGBM predictor is an additive tree model of the form
+
+$$
+\hat{m}(x)=\sum_{k=1}^{K} f_k(x),
+$$
+
+so it can capture nonlinearities and interactions between predictors. This can be viewed through the decomposition
+
+$$
+r_{i,t+1}=m(x_{i,t})+\varepsilon_{i,t+1},
+\qquad
+\mathbb{E}[\varepsilon_{i,t+1}\mid x_{i,t}] = 0.
+$$
+
+Momentum uses a restricted approximation $g(r_i^{\mathrm{past}})$, while LightGBM provides a more flexible approximation to $m(x_{i,t})$. If the true predictive signal is multi-dimensional and non-linear, the approximation error is smaller under LightGBM, leading to better ranking and portfolio construction.
+
+This is consistent with the backtest results. LightGBM achieves higher terminal wealth and log wealth, while also delivering a higher Sharpe ratio and lower maximum drawdown. In particular, the Sharpe ratio
+
+$$
+\mathrm{Sharpe}=\frac{\mathbb{E}[R_p]}{\sqrt{\mathrm{Var}(R_p)}}
+$$
+
+is substantially larger for LightGBM, suggesting a higher signal-to-noise ratio in the resulting portfolio returns.
+
+---
+
+# 4. Final Strategy Explanation
+
+## 4.1 Step-by-Step: How a Trade is Made
+
+The complete trading pipeline runs inside `initialise_state` and `trading_algorithm` in `gbm1.R`.  Below we trace each step explicitly using real data.
+
+```{r trade-demo-setup, cache=TRUE, results='hide'}
+source("./Strategy/Equal.R")
+initialise_state_eq  <- initialise_state
+trading_algorithm_eq <- trading_algorithm
+
+source("./Strategy/GroupA.R")
+
+# Backtest split: train < 2012-01-01, test >= 2012-01-01
+df_all      <- read.csv("./Data/df_train.csv")
+df_all$date <- as.Date(df_all$date)
+bt_split    <- as.Date("2012-01-01")
+df_train_bt <- df_all[df_all$date <  bt_split, ]
+df_test_bt  <- df_all[df_all$date >= bt_split, ]
+```
+
+**Step 1 — Initialise: Build matrices and train the LightGBM model.**
+
+`initialise_state` reshapes the long-format training data into wide price/volume matrices, calls `compute_all_features` to build `feat_3d`, then `build_training_data` to flatten it, and finally `train_lgb_fast` to fit the model.
+
+```{r trade-step1, cache=TRUE, dependson="trade-demo-setup"}
+cat("=== STEP 1: initialise_state(df_train_bt) ===\n")
+state <- initialise_state(df_train_bt)
+cat("Symbols:", length(state$symbols),
+    " | History rows:", nrow(state$close_mat),
+    " | Model trained:", !is.null(state$model), "\n")
+cat("Positions matrix shape [lookahead x symbols]:", dim(state$positions), "\n")
+```
+
+**Step 2 — Receive new data: append today's prices and drop the oldest row.**
+
+Each day `trading_algorithm` drops the oldest row from the sliding-window matrices and appends the new row, keeping the window exactly `train_length + warmup_days` rows.
+
+```{r trade-step2, cache=TRUE, dependson="trade-step1"}
+first_date <- min(df_test_bt$date)
+new_data   <- df_test_bt[df_test_bt$date == first_date, ]
+cat(sprintf("=== STEP 2: New data for %s (%d ETF rows) ===\n",
+            as.character(first_date), nrow(new_data)))
+
+# Reproduce the sliding-window update from trading_algorithm (identical code)
+new_close <- rep(NA, num_symbols); names(new_close) <- state$symbols
+new_vol   <- rep(NA, num_symbols); names(new_vol)   <- state$symbols
+new_open  <- rep(NA, num_symbols); names(new_open)  <- state$symbols
+new_close[new_data$symbol] <- new_data$close
+new_vol[new_data$symbol]   <- new_data$volume
+new_open[new_data$symbol]  <- new_data$open
+
+close_demo <- rbind(state$close_mat[-1, , drop=FALSE], new_close)
+vol_demo   <- rbind(state$vol_mat[-1,   , drop=FALSE], new_vol)
+open_demo  <- rbind(state$open_mat[-1,  , drop=FALSE], new_open)
+rownames(close_demo)[nrow(close_demo)] <- as.character(first_date)
+cat("Window size after update:", nrow(close_demo), "x", ncol(close_demo), "\n")
+
+ema_demo <- state$ema_state
+a12 <- 2/13; a26 <- 2/27; a9 <- 2/10
+ema_demo$ema12  <- ema_demo$ema12  + a12 * (new_close - ema_demo$ema12)
+ema_demo$ema26  <- ema_demo$ema26  + a26 * (new_close - ema_demo$ema26)
+macd_now        <- ema_demo$ema12  - ema_demo$ema26
+ema_demo$signal <- ema_demo$signal + a9  * (macd_now  - ema_demo$signal)
+n_cur     <- nrow(close_demo)
+delta_day <- new_close - close_demo[n_cur - 1, ]
+ema_demo$rsi_ag <- (ema_demo$rsi_ag * 13 + pmax(delta_day,  0)) / 14
+ema_demo$rsi_al <- (ema_demo$rsi_al * 13 + pmax(-delta_day, 0)) / 14
+cat("EMA/RSI state updated for", as.character(first_date), "\n")
+```
+
+**Step 3 — Extract features: call `extract_today_features` for all 100 ETFs at once.**
+
+This is the same function called inside `trading_algorithm`.  It computes RSI, MACD, Bollinger bands, returns, volatility, volume, and cross-sectional deciles — all O(1) using the stored EMA/RSI state and a trailing window of close/vol/open.
+
+```{r trade-step3, cache=TRUE, dependson="trade-step2"}
+cat("=== STEP 3: extract_today_features ===\n")
+feat_today <- extract_today_features(close_demo, vol_demo, open_demo,
+                                      state$ema_state,
+                                      as.character(first_date),
+                                      num_symbols)
+feat_today[is.na(feat_today)] <- 0
+cat("Feature matrix [ETFs x features]:", dim(feat_today), "\n")
+cat("ETF-1 first 6 features:\n")
+print(round(feat_today[1, 1:6, drop=FALSE], 4))
+```
+
+**Step 4 — Predict: score all 100 ETFs with the LightGBM model.**
+
+```{r trade-step4, cache=TRUE, dependson="trade-step3"}
+cat("=== STEP 4: predict 21-day returns ===\n")
+preds_demo <- predict(state$model, feat_today)
+cat(sprintf("Predicted return range: [%.4f, %.4f]\n", min(preds_demo), max(preds_demo)))
+cat("Top-5 ETFs (by predicted return):",
+    paste(state$symbols[order(preds_demo, decreasing=TRUE)[1:5]], collapse=", "), "\n")
+cat("Bot-5 ETFs (by predicted return):",
+    paste(state$symbols[order(preds_demo)[1:5]], collapse=", "), "\n")
+```
+
+**Step 5 — Rank and generate trades: long top-10, short bottom-10.**
+
+Position size is divided by `lookahead` (21) because the portfolio carries 21 overlapping position layers simultaneously; dividing ensures the total notional stays proportional to current wealth.
+
+```{r trade-step5, cache=TRUE, dependson="trade-step4"}
+cat("=== STEP 5: rank and generate trades ===\n")
+rnks_demo  <- rank(preds_demo, ties.method = "random")
+pos_size   <- max(state$wealth, 0.01) / (n_long + n_short) / lookahead
+new_pos    <- rep(0, num_symbols); names(new_pos) <- state$symbols
+new_pos[rnks_demo > (num_symbols - n_long)] <-  pos_size
+new_pos[rnks_demo <= n_short]               <- -pos_size
+cat("Position size per slot:", round(pos_size, 6), "\n")
+cat("LONG  (top 10):", paste(state$symbols[rnks_demo > 90], collapse=", "), "\n")
+cat("SHORT (bot 10):", paste(state$symbols[rnks_demo <= 10], collapse=", "), "\n")
+```
+
+**Step 6 — Position rolling window: insert the new position and track the 21-layer stack.**
+
+The `[21 x 100]` positions matrix updates every day with three lines identical to `trading_algorithm` in `gbm1.R`:
+
+```{r trade-step6, cache=TRUE, dependson="trade-step5"}
+
+prev_close <- close_demo[nrow(close_demo) - 1, ]
+cur_close  <- close_demo[nrow(close_demo), ]
+r1d <- cur_close / prev_close - 1
+r1d[is.na(r1d)] <- 0
+
+for (i in 1:lookahead) {
+  state$positions[i, ] <- state$positions[i, ] * (1 + r1d)
+}
+
+state$positions[2:lookahead, ] <- state$positions[1:(lookahead-1), ]
+
+state$positions[1, ] <- new_pos
+
+combined_pos <- colSums(state$positions)
+
+cat("=== STEP 6: Mark-to-Market and Roll Positions ===\n")
+cat("Total gross exposure (Notional) properly updated.\n")
+```
+
+We replay this for 25 test days using `extract_today_features` and `predict` from `gbm1.R`, without retraining, to show how the stack builds up.
+
+```{r rolling-window-sim, cache=TRUE, dependson="trade-step4", fig.height=4.5}
+state_rw      <- state   # copy initial state (positions = all zeros, model already trained)
+rw_dates      <- sort(unique(df_test_bt$date))[1:25]
+comb_exposure <- numeric(25)
+pos_snapshots <- list()
+
+for (d in seq_along(rw_dates)) {
+  nd <- df_test_bt[df_test_bt$date == rw_dates[d], ]
+
+  # Sliding window update -- identical to trading_algorithm in gbm1.R
+  new_close <- rep(NA, num_symbols); names(new_close) <- state_rw$symbols
+  new_vol   <- rep(NA, num_symbols); names(new_vol)   <- state_rw$symbols
+  new_open  <- rep(NA, num_symbols); names(new_open)  <- state_rw$symbols
+  new_close[nd$symbol] <- nd$close
+  new_vol[nd$symbol]   <- nd$volume
+  new_open[nd$symbol]  <- nd$open
+  close_rw <- rbind(state_rw$close_mat[-1, , drop=FALSE], new_close)
+  vol_rw   <- rbind(state_rw$vol_mat[-1,   , drop=FALSE], new_vol)
+  open_rw  <- rbind(state_rw$open_mat[-1,  , drop=FALSE], new_open)
+
+  n_rw <- nrow(close_rw)
+
+if (d > 1) {
+    prev_close <- close_rw[n_rw - 1, ]
+    cur_close  <- close_rw[n_rw, ]
+    r1d <- cur_close / prev_close - 1
+    r1d[is.na(r1d)] <- 0
+    
+    combined_pos <- colSums(state_rw$positions)
+    state_rw$wealth <- state_rw$wealth + sum(combined_pos * r1d)
+    
+    for (i in 1:lookahead) {
+      state_rw$positions[i, ] <- state_rw$positions[i, ] * (1 + r1d)
+    }
+  }
+  # Incremental EMA/RSI update -- identical to trading_algorithm in gbm1.R
+  ema_rw <- state_rw$ema_state
+  ema_rw$ema12  <- ema_rw$ema12  + (2/13) * (new_close - ema_rw$ema12)
+  ema_rw$ema26  <- ema_rw$ema26  + (2/27) * (new_close - ema_rw$ema26)
+  macd_rw       <- ema_rw$ema12  - ema_rw$ema26
+  ema_rw$signal <- ema_rw$signal + (2/10) * (macd_rw   - ema_rw$signal)
+  n_rw      <- nrow(close_rw)
+  delta_rw  <- new_close - close_rw[n_rw - 1, ]
+  ema_rw$rsi_ag <- (ema_rw$rsi_ag * 13 + pmax(delta_rw,  0)) / 14
+  ema_rw$rsi_al <- (ema_rw$rsi_al * 13 + pmax(-delta_rw, 0)) / 14
+  state_rw$ema_state <- ema_rw   # carry forward for next day
+
+  # Extract features -- same call as trading_algorithm in gbm1.R
+  feat_rw <- extract_today_features(close_rw, vol_rw, open_rw,
+                                     state_rw$ema_state,
+                                     as.character(rw_dates[d]),
+                                     num_symbols)
+  feat_rw[is.na(feat_rw)] <- 0
+
+  # Predict and rank -- identical to trading_algorithm in gbm1.R
+  preds_rw  <- predict(state_rw$model, feat_rw)
+  rnks_rw   <- rank(preds_rw, ties.method = "random")
+  ps        <- max(state_rw$wealth, 0.01) / (n_long + n_short) / lookahead
+  new_pos_rw <- rep(0, num_symbols); names(new_pos_rw) <- state_rw$symbols
+  new_pos_rw[rnks_rw > (num_symbols - n_long)] <-  ps
+  new_pos_rw[rnks_rw <= n_short]               <- -ps
+
+  # Update positions matrix -- IDENTICAL three lines from trading_algorithm in gbm1.R
+  pos_rw                <- state_rw$positions
+  pos_rw[2:lookahead, ] <- pos_rw[1:(lookahead - 1), ]
+  pos_rw[1, ]           <- new_pos_rw
+  state_rw$positions    <- pos_rw
+  state_rw$close_mat    <- close_rw
+  state_rw$vol_mat      <- vol_rw
+  state_rw$open_mat     <- open_rw
+
+  comb_exposure[d] <- sum(abs(colSums(pos_rw)))
+  if (d %in% c(1, 5, 10, 21)) pos_snapshots[[as.character(d)]] <- pos_rw
+}
+
+par(mfrow = c(1, 2))
+
+# Left: combined exposure builds linearly until all 21 layers are filled
+plot(1:25, comb_exposure, type = "b", pch = 20, col = "steelblue", lwd = 2,
+     xlab = "Trading Day", ylab = "Sum |colSums(positions)|",
+     main = "Combined Exposure Builds Over 21 Days")
+abline(v = lookahead, col = "red", lty = 2, lwd = 1.5)
+text(lookahead - 0.3, max(comb_exposure) * 0.97,
+     "All 21 layers\nactive", col = "red", cex = 0.7, adj = 1)
+
+# Right: heatmap of positions matrix at day 21 (fully stacked)
+pos21  <- pos_snapshots[["21"]]          # [21 layers x 100 ETFs]
+zlim_v <- max(abs(pos21))
+image(1:nrow(pos21), 1:ncol(pos21), pos21,
+      col  = colorRampPalette(c("red", "white", "green3"))(101),
+      zlim = c(-zlim_v, zlim_v),
+      xlab = "Position Layer (1 = newest, 21 = oldest)",
+      ylab = "ETF index",
+      main = "Positions Matrix at Day 21  [21 layers x 100 ETFs]")
+
+par(mfrow = c(1, 1))
+```
+
+```{r trade-plot, fig.height=4.5, dependson="trade-step5"}
+sorted_idx <- order(preds_demo)
+par(mfrow = c(2, 1), mar = c(3.5, 4, 2.5, 1))
+
+plot(seq_along(preds_demo), sort(preds_demo),
+     type = "p", pch = 20, col = "steelblue", cex = 0.8,
+     xlab = "Rank (1 = lowest predicted return)",
+     ylab = "Predicted 21-day Return",
+     main = paste("Step 4: LightGBM Predictions for", as.character(first_date)))
+abline(v = n_short + 0.5,          col = "red",   lty = 2, lwd = 1.5)
+abline(v = num_symbols - n_long + 0.5, col = "green3", lty = 2, lwd = 1.5)
+text(5,  max(preds_demo) * 0.85, "SHORT", col = "red",    cex = 1.1, font = 2)
+text(96, max(preds_demo) * 0.85, "LONG",  col = "green3", cex = 1.1, font = 2)
+
+barplot(new_pos[sorted_idx],
+        col    = ifelse(new_pos[sorted_idx] > 0, "green3",
+                 ifelse(new_pos[sorted_idx] < 0, "red", "gray80")),
+        border = NA,
+        main   = "Step 5: Resulting Long-Short Portfolio",
+        xlab   = "ETF (sorted by predicted return)",
+        ylab   = "Position size")
+legend("topright", legend = c("Long", "Short"), fill = c("green3", "red"), border = NA)
+par(mfrow = c(1, 1), mar = c(5.1, 4.1, 4.1, 2.1))
+```
+
+**Position rolling window.** The state holds a `[21 x 100]` positions matrix.  Each day the new position vector is inserted at row 1 and the oldest row is dropped.  Daily P&L is `sum(colSums(positions) * r1d)` — at steady state 21 overlapping layers are active, which is why `pos_size` is divided by `lookahead = 21`.
+
+**Incremental EMA/RSI updates (O(1)).** Between retrains, `trading_algorithm` updates EMA12, EMA26, MACD signal, and RSI gain/loss averages with a single multiplication per symbol per indicator.  Every 21 days a full batch recompute from `compute_all_features` resets the state to prevent floating-point drift.
+
+**Warmup period (200 days).** SMA200 needs 200 days of history; `build_training_data` skips all rows with index $\leq 200$, ensuring every training sample has valid features.
+
+## 4.2 Performance Summary
+
+We validate using the `walk_forward` function from `Test/walk_forward.R` (inlined to avoid its standalone execution block), mirroring the grader's evaluation exactly.  The **equal-weight buy-and-hold** from `Equal.R` is the baseline.
+
+```{r backtest, cache=TRUE, dependson="trade-demo-setup", message=FALSE, warning=FALSE, include=FALSE}
+# Inline walk_forward -- identical logic to Test/walk_forward.R
+walk_forward <- function(strategy, initialiser, df_train, df_test, cost_rate = 0.0005) {
+  state             <- initialiser(df_train)
+  unique_test_dates <- sort(unique(df_test$date))
+  n_test_dates      <- length(unique_test_dates)
+  positions         <- rep(0, num_symbols)
+  daily_pnl         <- rep(0, n_test_dates)
+  for (i in 1:n_test_dates) {
+    new_data <- df_test[df_test$date == unique_test_dates[i], ]
+    bunch(trades, state) %=% strategy(new_data, state)
+    if (i == 1) {
+      price        <- new_data[, "close"]
+      positions    <- trades
+      daily_pnl[i] <- -cost_rate * sum(abs(trades))
+    } else {
+      price_lag1   <- price
+      price        <- new_data[, "close"]
+      r1d          <- price / price_lag1 - 1
+      daily_pnl[i] <- sum(positions * r1d) - cost_rate * sum(abs(trades))
+      positions    <- positions * (1 + r1d) + trades
+    }
+  }
+  wealth_seq <- 1 + cumsum(daily_pnl)
+  if (any(wealth_seq <= 0)) {
+    first_idx <- which(wealth_seq <= 0)[1]
+    wealth_seq[first_idx:n_test_dates] <- 0
+  }
+  list(wealth = wealth_seq, dates = as.Date(unique_test_dates))
+}
+
+bt_lgb <- walk_forward(trading_algorithm, initialise_state, df_train_bt, df_test_bt)
+bt_eq  <- walk_forward(trading_algorithm_eq, initialise_state_eq, df_train_bt, df_test_bt)
+```
+
+```{r performance-metrics, dependson="backtest", include=FALSE}
+calc_metrics <- function(bt) {
+  w  <- bt$wealth
+  dr <- diff(w) / pmax(head(w, -1), 1e-10)
+  dr[is.na(dr) | is.infinite(dr)] <- 0
+  c(LogWealth     = round(log(max(tail(w, 1), 1e-10)), 4),
+    FinalWealth   = round(tail(w, 1), 4),
+    SharpeRatio   = round(mean(dr) / max(sd(dr), 1e-10) * sqrt(252), 2),
+    MaxDrawdownPct= round(max(ifelse(cummax(w) > 0, (cummax(w)-w)/cummax(w), 0))*100, 2))
+}
+perf <- rbind("LightGBM Strategy"      = calc_metrics(bt_lgb),
+              "Equal-Weight (Equal.R)" = calc_metrics(bt_eq))
+print(perf)
+```
+
+```{r wealth-plot, dependson="backtest", fig.height=4}
+plot(bt_lgb$dates, bt_lgb$wealth,
+     type = "l", col = "steelblue", lwd = 2,
+     xlab = "Date", ylab = "Wealth",
+     main = "Walk-Forward Backtest: Wealth Evolution")
+lines(bt_eq$dates, bt_eq$wealth, col = "gray60", lwd = 1.5, lty = 2)
+abline(h = 1, col = "black", lty = 3)
+legend("topleft",
+       legend = c("LightGBM Long-Short", "Equal-Weight Benchmark (Equal.R)"),
+       col = c("steelblue", "gray60"), lty = c(1, 2), lwd = 2)
+```
+
+## 4.3 Why This Strategy Works
+
+**Momentum capture.** The 21-day holding period targets the medium-term momentum effect. Features at horizons 1, 5, 10, 21, 42, 63 days let LightGBM identify which horizon is currently dominant.
+
+**Cross-sectional ranking removes market beta.** Long-shorting the top/bottom deciles makes the portfolio approximately market-neutral — profits come from *relative* ETF performance, not overall market direction.
+
+**Conservative regularisation.** `num_leaves = 3` produces very shallow trees. `feature_fraction = 0.3` (30% of features per tree) decorrelates individual boosting rounds. `learning_rate = 0.03` with `nrounds = 100` balances bias and variance better than aggressive, few-round fitting.
+
+**21-day rolling position window.** The `[21 x 100]` positions matrix stores 21 overlapping position layers. Daily P&L = `sum(colSums(positions) * r1d)`. Position size is divided by 21 to prevent over-leveraging from the layer stacking.
+
+**Incremental O(1) EMA/RSI state.** Updates between retrains cost one multiply per symbol per indicator; a full batch recompute every 21 days prevents drift.
+
+**Warmup period.** SMA200 requires 200 rows of history; the first 200 days are a burn-in window excluded from LightGBM training.
+
+
+
