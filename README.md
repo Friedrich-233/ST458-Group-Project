@@ -17,11 +17,13 @@ Dead simple, three steps:
 
 ## Folder Overview
 
-`Report Template.Rmd` | Main report file — this is the one you knit
-`Report-Template.pdf` | Rendered PDF output, for reference |
-`Data/` | Training data `df_train.csv` — 100 synthetic ETFs with open/close/volume |
-`Strategy/` | Three strategy scripts: `GroupA.R` (our LightGBM strategy, the main one), `Real.R` (momentum benchmark), `Equal.R` (equal-weight baseline) |
-`Test/` | `walk_forward.R` — the backtest framework, sourced by the Rmd |
-`Results/` | Cached hyperparameter tuning results (`hp_tuning_results.rds`) so the grid search doesn't re-run on every knit |
+| Path | Contents |
+|------|----------|
+| `Report Template.Rmd` | Main report file — this is the one you knit |
+| `Report-Template.pdf` | Rendered PDF output, for reference |
+| `Data/` | Training data `df_train.csv` — 100 synthetic ETFs with open/close/volume |
+| `Strategy/` | Three strategy scripts: `GroupA.R` (our LightGBM strategy, the main one), `Real.R` (momentum benchmark), `Equal.R` (equal-weight baseline) |
+| `Test/` | `walk_forward.R` — the backtest framework, sourced by the Rmd |
+| `Results/` | Cached hyperparameter tuning results (`hp_tuning_results.rds`) so the grid search doesn't re-run on every knit |
 
 ---
